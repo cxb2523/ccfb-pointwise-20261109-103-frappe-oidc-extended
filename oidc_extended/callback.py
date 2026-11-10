@@ -3,8 +3,12 @@
 # - https://github.com/frappe/frappe/blob/828490e01a3d14e1b0ac3385ea196c72ab2cc950/frappe/utils/oauth.py
 # - https://github.com/castlecraft/microsoft_integration/blob/main/microsoft_integration/callback.py
 
+import hmac
 import json
-import base64
+import secrets
+import time
+from urllib.parse import quote, urlencode
+
 import requests
 import jwt
 
@@ -15,8 +19,137 @@ from frappe import _ # For translations
 frappe.utils.logger.set_log_level("INFO")
 #frappe.utils.logger.set_log_level("DEBUG")
 
+# Lifetime of a login initiation (state/nonce) record in seconds.
+STATE_TTL_SECONDS = 600
+# Cache key prefix for the server-side state records.
+STATE_CACHE_PREFIX = "oidc_extended:state:"
+
+
+def _state_cache_key(state: str) -> str:
+    return STATE_CACHE_PREFIX + state
+
+
+def _sanitize_redirect(redirect_to: str | None) -> str | None:
+    """Allows only same-site relative paths; anything else is dropped to avoid open redirects."""
+    if redirect_to and redirect_to.startswith("/") and not redirect_to.startswith("//"):
+        return redirect_to
+    return None
+
+
+def _fail_login():
+    """Terminates the login flow with a generic error.
+
+    All failures (unknown state, expired state, mismatched nonce, ...) are
+    intentionally indistinguishable to avoid leaking information to an attacker.
+    """
+    frappe.local.response["type"] = "redirect"
+    frappe.local.response["location"] = "/login?error=" + quote(_("OIDC login failed. Please try again."))
+
+
+def _store_state_record(state: str, nonce: str, redirect_to: str | None) -> dict:
+    record = {
+        "state": state,
+        "nonce": nonce,
+        "expires_at": time.time() + STATE_TTL_SECONDS,
+        "redirect_to": redirect_to,
+    }
+    frappe.cache().set_value(_state_cache_key(state), record, expires_in_sec=STATE_TTL_SECONDS)
+    return record
+
+
+def _pop_state_record(state: str | None) -> dict | None:
+    """Atomically fetches and deletes the state record, so it cannot be replayed."""
+    if not state:
+        return None
+
+    cache = frappe.cache()
+    key = _state_cache_key(state)
+
+    # Redis GETDEL is atomic; fall back to get+delete for cache backends without it.
+    getdel = getattr(cache, "getdel", None)
+    if callable(getdel):
+        return getdel(key)
+
+    record = cache.get_value(key)
+    if record is not None:
+        cache.delete_value(key)
+    return record
+
+
+def _is_valid_state_record(record: dict | None, state: str | None) -> bool:
+    if not record:
+        return False
+    if not hmac.compare_digest(str(record.get("state") or ""), str(state or "")):
+        return False
+    if not record.get("nonce"):
+        return False
+    if record.get("expires_at", 0) < time.time():
+        return False
+    return True
+
+
+def _is_valid_id_token(id_token: dict, state_record: dict, social_login_provider) -> bool:
+    """Validates the iss, aud, exp and nonce claims of the decoded id token."""
+    expected_iss = (social_login_provider.base_url or "").rstrip("/")
+    actual_iss = str(id_token.get("iss") or "").rstrip("/")
+    if not expected_iss or not hmac.compare_digest(actual_iss, expected_iss):
+        frappe.logger().warning("OIDC login failed: unexpected id token issuer.")
+        return False
+
+    audience = id_token.get("aud")
+    audiences = audience if isinstance(audience, list) else [audience]
+    if social_login_provider.client_id not in audiences:
+        frappe.logger().warning("OIDC login failed: unexpected id token audience.")
+        return False
+
+    try:
+        expires_at = float(id_token.get("exp"))
+    except (TypeError, ValueError):
+        expires_at = 0
+    if expires_at <= time.time():
+        frappe.logger().warning("OIDC login failed: id token is expired or has no exp claim.")
+        return False
+
+    nonce = id_token.get("nonce")
+    if not nonce or not hmac.compare_digest(str(nonce), str(state_record["nonce"])):
+        frappe.logger().warning("OIDC login failed: id token nonce is missing or does not match.")
+        return False
+
+    return True
+
+
 @frappe.whitelist(allow_guest=True)
-def custom(code: str, state: str | dict):
+def login(provider: str, redirect_to: str | None = None):
+    """Initiates an OIDC login for the given provider.
+
+    Generates a high-entropy state and nonce, stores a server-side record
+    keyed by the state (carrying the nonce, an expiry and the initiation
+    origin), and redirects to the provider's authorization endpoint.
+    """
+    social_login_provider = frappe.get_doc("Social Login Key", frappe.get_conf().get("custom", provider))
+
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    _store_state_record(state, nonce, _sanitize_redirect(redirect_to))
+
+    auth_url_data = json.loads(social_login_provider.auth_url_data or "{}")
+    query = {
+        "response_type": "code",
+        "client_id": social_login_provider.client_id,
+        "redirect_uri": frappe.utils.get_url(social_login_provider.redirect_url),
+        "scope": auth_url_data.get("scope"),
+        "state": state,
+        "nonce": nonce,
+    }
+
+    frappe.local.response["type"] = "redirect"
+    frappe.local.response["location"] = (
+        social_login_provider.base_url + social_login_provider.authorize_url + "?" + urlencode(query)
+    )
+
+
+@frappe.whitelist(allow_guest=True)
+def custom(code: str, state: str):
     """Callback for processing the request received after a successful authentication in an identity provider (OIDC provider).
 
     OIDC redirect URL: /api/method/oidc_extended.callback.custom/<provider name>
@@ -26,10 +159,13 @@ def custom(code: str, state: str | dict):
     - Maps groups from the claim of id token to ERPNext roles.
     """
 
-    state = json.loads(base64.b64decode(state).decode("utf-8"))
-
-    if not state or not state["token"]:
-        frappe.respond_as_web_page(_("Invalid request"), _("Token is missing."), http_status_code=417)
+    # The state is consumed (fetched and deleted) before anything else, so a
+    # second callback with the same state (replay, refresh, concurrent tabs)
+    # always fails. If a later step (e.g. the token exchange) fails, the user
+    # has to start a new login - an accepted trade-off in favor of replay safety.
+    state_record = _pop_state_record(state)
+    if not _is_valid_state_record(state_record, state):
+        _fail_login()
         return
 
     request_path_components = frappe.request.path[1:].split("/")
@@ -67,7 +203,12 @@ def custom(code: str, state: str | dict):
         data=token_request_data,
     ).json()
 
-    id_token = jwt.decode(token_response["id_token"], audience="erpnext", options={"verify_signature": False})
+    id_token = jwt.decode(token_response["id_token"], options={"verify_signature": False})
+
+    if not _is_valid_id_token(id_token, state_record, social_login_provider):
+        _fail_login()
+        return
+
     username = id_token[user_id_claim_name]
 
     if email_claim_name in id_token:
@@ -122,7 +263,7 @@ def custom(code: str, state: str | dict):
             frappe.logger().error(f"Error fetching user: {str(e)}")
             frappe.logger().exception(e)
             raise
-            
+
         frappe.logger().info(f"The existing user {username} fetched successfully.")
         frappe.logger().debug(f"The existing user data: {user.as_dict()}")
     else:
@@ -165,7 +306,7 @@ def custom(code: str, state: str | dict):
     # Delegate role mapping to Frappe's native role_profiles table.
     frappe.logger().debug(f"Mapping groups to role profiles for user {username}.")
     role_profiles = [group_role_mapping.role_profile for group_role_mapping in getattr(oidc_extended_configuration, "group_role_mappings", []) if group_role_mapping.group in groups]
-    
+
     # If no groups match, assign the fallback role profiles if configured
     if not role_profiles:
         if getattr(oidc_extended_configuration, "fallback_role_profiles", None):
@@ -175,7 +316,7 @@ def custom(code: str, state: str | dict):
     # Frappe natively allows Multiple Role Profiles via the "role_profiles" child table.
     current_role_profiles = {rp.role_profile for rp in user.get("role_profiles", [])}
     new_role_profiles = set(role_profiles)
-    
+
     # Check if role profiles changed to clear sessions if they were downgraded or changed
     role_profiles_changed = current_role_profiles != new_role_profiles
 
@@ -186,7 +327,7 @@ def custom(code: str, state: str | dict):
     # Delegate module blocking to Frappe's native module profile field.
     frappe.logger().debug(f"Mapping groups to module profiles for user {username}.")
     module_profiles = [m.module_profile for m in getattr(oidc_extended_configuration, "group_module_mappings", []) if m.group in groups]
-    
+
     if module_profiles:
         # Currently, Frappe User doctype supports a single Module Profile natively.
         # We assign the first matched profile.
@@ -195,7 +336,7 @@ def custom(code: str, state: str | dict):
         # If no groups match, assign the fallback module profile if configured.
         fallback_module_profile = getattr(oidc_extended_configuration, "fallback_module_profile", None)
         user.module_profile = fallback_module_profile or None
-                
+
     user.save()
 
     if role_profiles_changed:
@@ -210,11 +351,15 @@ def custom(code: str, state: str | dict):
 
     redirect_post_login(
         desk_user=frappe.local.response.get("message") == "Logged In",
-        redirect_to=state.get("redirect_to")
+        redirect_to=state_record.get("redirect_to")
     )
 
 def redirect_post_login(desk_user: bool, redirect_to: str):
     frappe.local.response["type"] = "redirect"
+
+    # Never trust a redirect target coming from the request; only same-site
+    # relative paths stored at login initiation are honored.
+    redirect_to = _sanitize_redirect(redirect_to)
 
     if not redirect_to:
         desk_uri = "/app"
