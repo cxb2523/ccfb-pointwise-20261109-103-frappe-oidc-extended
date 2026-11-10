@@ -1,0 +1,134 @@
+{
+ "actions": [],
+ "autoname": "format:{provider}",
+ "creation": "2023-06-16 19:03:33.874968",
+ "default_view": "List",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "provider",
+  "claims_section",
+  "given_name_claim_name",
+  "family_name_claim_name",
+  "email_claim_name",
+  "groups_claim_name",
+  "column_break_0",
+  "roles_section",
+  "fallback_role_profiles",
+  "group_role_mappings",
+  "modules_section",
+  "fallback_module_profile",
+  "group_module_mappings"
+ ],
+ "fields": [
+  {
+   "fieldname": "provider",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Social Login (OIDC) Provider",
+   "options": "Social Login Key",
+   "reqd": 1,
+   "set_only_once": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "claims_section",
+   "fieldtype": "Section Break",
+   "label": "Token Claims"
+  },
+  {
+   "default": "given_name",
+   "fieldname": "given_name_claim_name",
+   "fieldtype": "Data",
+   "label": "Given Name Claim"
+  },
+  {
+   "default": "family_name",
+   "fieldname": "family_name_claim_name",
+   "fieldtype": "Data",
+   "label": "Family Name Claim"
+  },
+  {
+   "default": "email",
+   "fieldname": "email_claim_name",
+   "fieldtype": "Data",
+   "label": "Email Claim"
+  },
+  {
+   "default": "groups",
+   "description": "The name of the claim that includes a list of user groups.",
+   "fieldname": "groups_claim_name",
+   "fieldtype": "Data",
+   "label": "Groups Claim"
+  },
+  {
+   "fieldname": "column_break_0",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "roles_section",
+   "fieldtype": "Section Break",
+   "label": "Roles"
+  },
+  {
+   "fieldname": "fallback_role_profiles",
+   "fieldtype": "Table",
+   "label": "Fallback Role Profiles",
+   "options": "OIDC Fallback Role Profile",
+   "description": "If a user has no matching group mappings, they will be assigned these fallback role profiles."
+  },
+  {
+   "fieldname": "group_role_mappings",
+   "fieldtype": "Table",
+   "label": "Group To Role Mappings",
+   "options": "OIDC Group To Role Mapping",
+   "description": "Map OIDC groups to ERPNext roles. This assigns permissions allowing users to access data and make changes based on their role."
+  },
+  {
+   "fieldname": "modules_section",
+   "fieldtype": "Section Break",
+   "label": "Modules Mapping"
+  },
+  {
+   "description": "If a user has no matching group mappings, they will be assigned this fallback module profile.",
+   "fieldname": "fallback_module_profile",
+   "fieldtype": "Link",
+   "label": "Fallback Module Profile",
+   "options": "Module Profile"
+  },
+  {
+   "fieldname": "group_module_mappings",
+   "fieldtype": "Table",
+   "label": "Group To Module Mappings",
+   "options": "OIDC Group To Module Mapping",
+   "description": "Map OIDC groups to ERPNext modules. This controls which modules are visible on the workspace/sidebar for the user."
+  }
+ ],
+ "links": [],
+ "modified": "2023-06-17 11:12:05.250379",
+ "modified_by": "Administrator",
+ "module": "OIDC Extended",
+ "name": "OIDC Extended Configuration",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "provider",
+ "track_changes": 1
+}
